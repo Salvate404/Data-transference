@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0c0c0a" />
+    <meta name="description" content="Passe arquivos de um aparelho pro outro. Sem nuvem, sem conta." />
+    <title>Passe</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="word">Passe</span>
+        </div>
+        <p class="tag" id="path-hint">Nada fica salvo. Direto de um aparelho ao outro.</p>
+        <div class="top-status" id="top-status" data-state="idle">aguardando</div>
+      </header>
+
+      <main class="layout">
+        <section class="ticket" id="ticket">
+          <div class="ticket-cut" aria-hidden="true"></div>
+          <div class="ticket-main">
+            <p class="kicker">Sala</p>
+            <h1 class="code" id="room-code">····</h1>
+            <p class="ticket-sub" id="ticket-sub">Abre no outro aparelho e aponta a câmera</p>
+            <div class="ticket-actions">
+              <button type="button" class="ghost" id="copy-code">Copiar código</button>
+              <button type="button" class="ghost" id="copy-link">Copiar link</button>
+            </div>
+            <form class="join" id="join-form">
+              <label class="sr" for="join-code">Entrar numa sala</label>
+              <input
+                id="join-code"
+                name="code"
+                maxlength="6"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Já tem um código?"
+                inputmode="text"
+              />
+              <button type="submit">Entrar</button>
+            </form>
+          </div>
+          <div class="ticket-stub">
+            <img id="qr" alt="QR da sala" />
+            <p class="stub-label">escaneia e entra</p>
+          </div>
+        </section>
+
+        <section class="stage" id="stage" hidden>
+          <div class="peers" id="peers">
+            <div class="peer">
+              <span class="dot me"></span>
+              <strong id="me-name">Você</strong>
+            </div>
+            <div class="rail" id="rail" data-path="unknown">
+              <span class="rail-line"></span>
+            </div>
+            <div class="peer">
+              <span class="dot them"></span>
+              <strong id="them-name">Outro aparelho</strong>
+            </div>
+          </div>
+
+          <label class="drop" id="drop">
+            <input id="file-input" type="file" multiple hidden />
+            <span class="drop-title">Solta aqui</span>
+            <span class="drop-sub">arquivo, vários, ou pasta · qualquer tamanho</span>
+            <span class="drop-btns">
+              <button type="button" class="solid" id="pick-files">Escolher arquivos</button>
+              <button type="button" class="ghost" id="pick-folder">Pasta</button>
+            </span>
+          </label>
+          <input id="folder-input" type="file" webkitdirectory multiple hidden />
+
+          <ul class="transfers" id="transfers"></ul>
+        </section>
+      </main>
+
+      <footer class="foot">
+        <p id="foot-note">O servidor só junta os dois. O arquivo não passa por disco nenhum.</p>
+      </footer>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
