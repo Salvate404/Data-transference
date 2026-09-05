@@ -1,6 +1,8 @@
-const CHUNK = 64 * 1024;
-const WINDOW = 1024 * 1024;
-const HIGH_WATER = 2 * 1024 * 1024;
+const CHUNK = 256 * 1024;
+const READ = 2 * 1024 * 1024;
+const HIGH_WATER = 8 * 1024 * 1024;
+const UI_MS = 250;
+const ACCEPT_MS = 3000;
 const ICE = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -57,25 +59,6 @@ function bytes(n) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-function hex(buf) {
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function sha256(buf) {
-  return hex(await crypto.subtle.digest("SHA-256", buf));
-}
-
-function concat(parts) {
-  const n = parts.reduce((a, p) => a + p.byteLength, 0);
-  const out = new Uint8Array(n);
-  let o = 0;
-  for (const p of parts) {
-    out.set(p instanceof Uint8Array ? p : new Uint8Array(p), o);
-    o += p.byteLength;
-  }
-  return out;
-}
-
 function displayName(file) {
   return file.relativePath || file.webkitRelativePath || file.name;
 }
@@ -130,35 +113,6 @@ async function detectPath(pc) {
   return "net";
 }
 
-class WindowHasher {
-  constructor() {
-    this.parts = [];
-    this.len = 0;
-    this.hashes = [];
-  }
-
-  async push(chunk) {
-    const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-    this.parts.push(u8);
-    this.len += u8.byteLength;
-    while (this.len >= WINDOW) await this.flush(WINDOW);
-  }
-
-  async finish() {
-    if (this.len) await this.flush(this.len);
-    return this.hashes;
-  }
-
-  async flush(take) {
-    const merged = concat(this.parts);
-    const slice = merged.subarray(0, take);
-    const rest = merged.subarray(take);
-    this.hashes.push(await sha256(slice));
-    this.parts = rest.byteLength ? [rest] : [];
-    this.len = rest.byteLength;
-  }
-}
-
 class MemorySink {
   constructor(meta, start = 0) {
     this.meta = meta;
@@ -167,7 +121,7 @@ class MemorySink {
     this.kind = "mem";
   }
 
-  async write(buf) {
+  write(buf) {
     this.parts.push(buf);
     this.received += buf.byteLength;
   }
@@ -231,28 +185,55 @@ function saveBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 8_000);
 }
 
-function renderItem(row) {
-  let li = document.querySelector(`[data-row="${CSS.escape(row.key)}"]`);
-  if (!li) {
-    li = document.createElement("li");
-    li.className = "item";
-    li.dataset.row = row.key;
-    li.innerHTML = `<div><h3></h3><p class="meta"></p></div><span class="dir"></span><div class="bar"><i></i></div>`;
-    ui.transfers.prepend(li);
-  }
-  li.classList.toggle("recv", row.dir === "recv");
-  li.classList.toggle("ok", row.state === "ok");
-  li.classList.toggle("bad", row.state === "bad");
-  li.querySelector("h3").textContent = row.name;
-  li.querySelector(".dir").textContent = row.dir === "send" ? "enviando" : "recebendo";
-  if (row.state === "ok") li.querySelector(".dir").textContent = "pronto";
-  if (row.state === "bad") li.querySelector(".dir").textContent = "falhou";
+const rows = new Map();
+
+function paintRow(rec, row) {
+  rec.painted = performance.now();
+  rec.pending = null;
+  rec.li.classList.toggle("recv", row.dir === "recv");
+  rec.li.classList.toggle("ok", row.state === "ok");
+  rec.li.classList.toggle("bad", row.state === "bad");
+  rec.title.textContent = row.name;
+  rec.dir.textContent =
+    row.state === "ok" ? "pronto" : row.state === "bad" ? "falhou" : row.dir === "send" ? "enviando" : "recebendo";
   const pct = row.size ? Math.min(100, (row.done / row.size) * 100) : 0;
-  li.querySelector("i").style.width = `${pct}%`;
+  rec.bar.style.width = `${pct}%`;
   const speed = row.speed ? ` · ${bytes(row.speed)}/s` : "";
   const eta =
     row.speed && row.size > row.done ? ` · ~${Math.max(1, Math.round((row.size - row.done) / row.speed))}s` : "";
-  li.querySelector(".meta").textContent = `${bytes(row.done)} / ${bytes(row.size)}${speed}${eta}`;
+  rec.meta.textContent = `${bytes(row.done)} / ${bytes(row.size)}${speed}${eta}`;
+}
+
+function renderItem(row, force = false) {
+  let rec = rows.get(row.key);
+  if (!rec) {
+    const li = document.createElement("li");
+    li.className = "item";
+    li.innerHTML = `<div><h3></h3><p class="meta"></p></div><span class="dir"></span><div class="bar"><i></i></div>`;
+    rec = {
+      li,
+      title: li.querySelector("h3"),
+      meta: li.querySelector(".meta"),
+      dir: li.querySelector(".dir"),
+      bar: li.querySelector("i"),
+      painted: 0,
+      pending: null,
+      raf: 0,
+    };
+    rows.set(row.key, rec);
+    ui.transfers.prepend(li);
+  }
+  if (!force && row.state === "run" && rec.painted && performance.now() - rec.painted < UI_MS) {
+    rec.pending = row;
+    if (!rec.raf) {
+      rec.raf = requestAnimationFrame(() => {
+        rec.raf = 0;
+        if (rec.pending) paintRow(rec, rec.pending);
+      });
+    }
+    return;
+  }
+  paintRow(rec, row);
 }
 
 class Pipe {
@@ -260,12 +241,19 @@ class Pipe {
     this.ch = channel;
     this.ch.binaryType = "arraybuffer";
     this.onBusy = onBusy;
-    this.outgoing = new Map();
     this.queue = [];
     this.sending = false;
+    this.waitingAccept = false;
+    this.acceptTimer = 0;
     this.recv = null;
     this.partials = new Map();
-    this.ch.onmessage = (ev) => this.onMessage(ev.data);
+    this.inbox = Promise.resolve();
+    this.ch.onmessage = (ev) => {
+      const data = ev.data;
+      this.inbox = this.inbox.then(() => this.onMessage(data)).catch((err) => {
+        console.warn("passe: mensagem", err);
+      });
+    };
   }
 
   sendJson(msg) {
@@ -274,7 +262,7 @@ class Pipe {
 
   enqueue(files) {
     for (const file of files) {
-        this.queue.push({
+      this.queue.push({
         id: fileKey(file),
         name: displayName(file),
         size: file.size,
@@ -288,12 +276,22 @@ class Pipe {
   offer() {
     if (this.sending || !this.queue.length || this.ch.readyState !== "open") return;
     this.sending = true;
+    this.waitingAccept = true;
     this.batch = this.queue.splice(0, this.queue.length);
     this.sendJson({
       type: "offer-files",
       files: this.batch.map(({ file, ...meta }) => meta),
     });
     this.onBusy?.(true);
+    clearTimeout(this.acceptTimer);
+    this.acceptTimer = setTimeout(() => {
+      if (!this.waitingAccept) return;
+      this.waitingAccept = false;
+      this.sending = false;
+      this.onBusy?.(false);
+      console.warn("passe: timeout accept-files");
+      toast("O outro aparelho não aceitou o envio. Tenta de novo.");
+    }, ACCEPT_MS);
   }
 
   resumeMap() {
@@ -316,16 +314,20 @@ class Pipe {
         return;
       }
       if (msg.type === "offer-files") {
+        for (const meta of msg.files) await this.prepareRecv(meta);
         this.sendJson({ type: "accept-files", resume: this.resumeMap() });
-        for (const meta of msg.files) this.prepareRecv(meta);
         return;
       }
       if (msg.type === "accept-files") {
-        await this.sendBatch(msg.resume || {});
+        this.waitingAccept = false;
+        clearTimeout(this.acceptTimer);
+        this.sendBatch(msg.resume || {}).catch((err) => {
+          console.warn("passe: lote", err);
+        });
         return;
       }
       if (msg.type === "file-start") {
-        await this.beginRecv(msg);
+        this.beginRecv(msg);
         return;
       }
       if (msg.type === "file-end") {
@@ -335,102 +337,135 @@ class Pipe {
       return;
     }
 
-    if (!this.recv) return;
-    const buf = data instanceof ArrayBuffer ? data : await data.arrayBuffer?.() ?? data;
-    await this.recv.sink.write(buf);
-    await this.recv.hasher.push(buf);
+    if (!this.recv) {
+      console.warn("passe: chunk sem file-start");
+      return;
+    }
+    const buf = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+    const written = this.recv.sink.write(buf);
+    if (written && typeof written.then === "function") await written;
     this.tickRecv();
   }
 
-  prepareRecv(meta) {
-    if (!this.partials.has(meta.id)) {
-      renderItem({
-        key: `r:${meta.id}`,
-        name: meta.name,
-        size: meta.size,
-        done: 0,
-        dir: "recv",
-        state: "run",
-      });
-    }
+  async prepareRecv(meta) {
+    const start = this.partials.get(meta.id)?.received || 0;
+    renderItem(
+      { key: `r:${meta.id}`, name: meta.name, size: meta.size, done: start, dir: "recv", state: "run" },
+      true,
+    );
+    if (this.partials.has(meta.id)) return;
+    const sink = await openSink({ ...meta, fileId: meta.id }, start);
+    this.partials.set(meta.id, sink);
   }
 
-  async beginRecv(msg) {
-    const start = this.partials.get(msg.fileId)?.received || 0;
-    const sink = this.partials.get(msg.fileId) || (await openSink(msg, start));
-    if (!this.partials.has(msg.fileId)) this.partials.set(msg.fileId, sink);
+  beginRecv(msg) {
+    let sink = this.partials.get(msg.fileId);
+    if (!sink) {
+      sink = new MemorySink(msg, msg.offset || 0);
+      this.partials.set(msg.fileId, sink);
+    }
     this.recv = {
       meta: msg,
       sink,
-      hasher: new WindowHasher(),
       t0: performance.now(),
-      last: start,
+      last: sink.received,
     };
     this.onBusy?.(true);
+    console.log("passe: file-start", msg.name, msg.size);
+    renderItem(
+      { key: `r:${msg.fileId}`, name: msg.name, size: msg.size, done: sink.received, dir: "recv", state: "run" },
+      true,
+    );
   }
 
   tickRecv() {
     const r = this.recv;
     const now = performance.now();
     const dt = (now - r.t0) / 1000;
-    const done = r.sink.received;
     renderItem({
       key: `r:${r.meta.fileId}`,
       name: r.meta.name,
       size: r.meta.size,
-      done,
-      speed: dt > 0.2 ? (done - r.last) / dt : 0,
+      done: r.sink.received,
+      speed: dt > 0.2 ? (r.sink.received - r.last) / dt : 0,
       dir: "recv",
       state: "run",
     });
-    if (dt > 0.4) {
+    if (dt > UI_MS / 1000) {
       r.t0 = now;
-      r.last = done;
+      r.last = r.sink.received;
     }
   }
 
   async finishRecv(msg) {
     const r = this.recv;
-    if (!r) return;
-    const hashes = await r.hasher.finish();
-    const ok = hashes.length === msg.hashes.length && hashes.every((h, i) => h === msg.hashes[i]);
-    if (!ok) {
-      renderItem({
-        key: `r:${msg.fileId}`,
-        name: r.meta.name,
-        size: r.meta.size,
-        done: r.sink.received,
-        dir: "recv",
-        state: "bad",
-      });
-      toast("Arquivo chegou corrompido. Pede pra mandar de novo.");
-      this.partials.delete(msg.fileId);
-      this.recv = null;
-      this.onBusy?.(false);
+    if (!r) {
+      console.warn("passe: file-end sem file-start", msg.fileId);
       return;
     }
-    const blob = await r.sink.toBlob();
-    saveBlob(blob, r.meta.name);
-    this.partials.delete(msg.fileId);
-    renderItem({
-      key: `r:${msg.fileId}`,
-      name: r.meta.name,
-      size: r.meta.size,
-      done: r.meta.size,
-      dir: "recv",
-      state: "ok",
-    });
+    const got = r.sink.received;
+    const expect = r.meta.size;
+    console.log("passe: file-end", r.meta.name, got, "/", expect);
+    try {
+      if (got !== expect) {
+        renderItem(
+          { key: `r:${msg.fileId}`, name: r.meta.name, size: expect, done: got, dir: "recv", state: "bad" },
+          true,
+        );
+        toast("Arquivo incompleto. Pede pra mandar de novo.");
+        this.partials.delete(msg.fileId);
+        this.recv = null;
+        this.onBusy?.(false);
+        return;
+      }
+      const blob = await r.sink.toBlob();
+      saveBlob(blob, r.meta.name);
+      this.partials.delete(msg.fileId);
+      renderItem(
+        { key: `r:${msg.fileId}`, name: r.meta.name, size: expect, done: expect, dir: "recv", state: "ok" },
+        true,
+      );
+    } catch (err) {
+      console.warn("passe: finish falhou", err);
+      renderItem(
+        { key: `r:${msg.fileId}`, name: r.meta.name, size: expect, done: got, dir: "recv", state: "bad" },
+        true,
+      );
+      toast("Não deu pra salvar o arquivo.");
+    }
     this.recv = null;
     this.onBusy?.(false);
   }
 
   async sendBatch(resume) {
     for (const item of this.batch) {
-      await this.sendFile(item, resume[item.id] || 0);
+      try {
+        await this.sendFile(item, resume[item.id] || 0);
+      } catch (err) {
+        console.warn("passe: send falhou", item.name, err);
+        renderItem(
+          { key: `s:${item.id}`, name: item.name, size: item.size, done: 0, dir: "send", state: "bad" },
+          true,
+        );
+        toast(`Não deu pra enviar ${item.name}`);
+      }
     }
     this.sending = false;
     this.onBusy?.(false);
     this.offer();
+  }
+
+  waitBuffer() {
+    this.ch.bufferedAmountLowThreshold = HIGH_WATER / 2;
+    if (this.ch.bufferedAmount <= HIGH_WATER) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        this.ch.removeEventListener("bufferedamountlow", done);
+        resolve();
+      };
+      this.ch.addEventListener("bufferedamountlow", done);
+      if (this.ch.bufferedAmount <= HIGH_WATER / 2) done();
+    });
   }
 
   async sendFile(item, start) {
@@ -444,60 +479,54 @@ class Pipe {
       mime: item.mime,
       offset: offset0,
     });
+    console.log("passe: send", item.name, item.size, "from", offset0);
+    renderItem(
+      { key: `s:${item.id}`, name: item.name, size: item.size, done: offset0, dir: "send", state: "run" },
+      true,
+    );
 
-    const hasher = new WindowHasher();
     let t0 = performance.now();
     let last = offset;
+    const readBlock = (off) => item.file.slice(off, Math.min(item.size, off + READ)).arrayBuffer();
+    let prefetch = offset < item.size ? readBlock(offset) : null;
 
     while (offset < item.size) {
       if (this.ch.readyState !== "open") throw new Error("conexao");
-      this.ch.bufferedAmountLowThreshold = HIGH_WATER / 2;
-      if (this.ch.bufferedAmount > HIGH_WATER) {
-        await new Promise((resolve) => {
-          const done = () => {
-            this.ch.removeEventListener("bufferedamountlow", done);
-            resolve();
-          };
-          this.ch.addEventListener("bufferedamountlow", done);
-          if (this.ch.bufferedAmount <= HIGH_WATER / 2) done();
-        });
-      }
-      const end = Math.min(item.size, offset + CHUNK);
-      const chunk = await item.file.slice(offset, end).arrayBuffer();
-      this.ch.send(chunk);
-      await hasher.push(chunk);
-      offset = end;
-
-      const now = performance.now();
-      const dt = (now - t0) / 1000;
-      renderItem({
-        key: `s:${item.id}`,
-        name: item.name,
-        size: item.size,
-        done: offset,
-        speed: dt > 0.2 ? (offset - last) / dt : 0,
-        dir: "send",
-        state: "run",
-      });
-      if (dt > 0.4) {
-        t0 = now;
-        last = offset;
+      await this.waitBuffer();
+      const block = await prefetch;
+      const next = offset + block.byteLength;
+      prefetch = next < item.size ? readBlock(next) : null;
+      const bytes = new Uint8Array(block);
+      for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+        if (this.ch.readyState !== "open") throw new Error("conexao");
+        await this.waitBuffer();
+        const end = Math.min(bytes.byteLength, i + CHUNK);
+        this.ch.send(bytes.buffer.slice(bytes.byteOffset + i, bytes.byteOffset + end));
+        offset += end - i;
+        const now = performance.now();
+        const dt = (now - t0) / 1000;
+        if (dt >= UI_MS / 1000 || offset >= item.size) {
+          renderItem({
+            key: `s:${item.id}`,
+            name: item.name,
+            size: item.size,
+            done: offset,
+            speed: dt > 0.2 ? (offset - last) / dt : 0,
+            dir: "send",
+            state: "run",
+          });
+          t0 = now;
+          last = offset;
+        }
       }
     }
 
-    this.sendJson({
-      type: "file-end",
-      fileId: item.id,
-      hashes: await hasher.finish(),
-    });
-    renderItem({
-      key: `s:${item.id}`,
-      name: item.name,
-      size: item.size,
-      done: item.size,
-      dir: "send",
-      state: "ok",
-    });
+    this.sendJson({ type: "file-end", fileId: item.id, size: item.size });
+    console.log("passe: file-end sent", item.name, item.size);
+    renderItem(
+      { key: `s:${item.id}`, name: item.name, size: item.size, done: item.size, dir: "send", state: "ok" },
+      true,
+    );
   }
 }
 
